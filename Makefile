@@ -39,7 +39,22 @@ AUTH_STACK ?= $(PROJECT_NAME)-auth
 APP_STACK ?= $(PROJECT_NAME)-backend
 ECR_STACK ?= $(PROJECT_NAME)-ecr
 FRONTEND_STACK ?= $(PROJECT_NAME)-frontend
+REPORTS_STACK ?= $(PROJECT_NAME)-reports
 IMAGE_TAG ?= latest
+# Lab 5, the weekly report (infra/reports.yml). Set these in .env.
+#   REPORTS_SENDER     the From address: a verified SES identity (your email, or
+#                      reports@<REPORTS_DOMAIN> once that domain is verified)
+#   REPORTS_RECIPIENTS comma-separated To addresses; in the SES sandbox each must
+#                      be verified too. Defaults to the sender.
+#   REPORTS_DOMAIN     optional: creates an SES domain identity (Easy DKIM)
+REPORTS_RECIPIENTS ?= $(REPORTS_SENDER)
+# Testing overrides: make aws-deploy-reports REPORTS_SCHEDULE="rate(5 minutes)"
+REPORTS_SCHEDULE ?= cron(0 7 ? * MON *)
+REPORTS_SCHEDULE_TARGET ?= queue
+REPORTS_FAIL_WEEK ?=
+# Empty: create the S3 gateway endpoint unless the VPC already has one.
+REPORTS_CREATE_S3_ENDPOINT ?=
+SINCE ?= 1h
 # x86_64 or arm64. arm64 is ~20% cheaper on Lambda and builds natively on
 # Apple Silicon; the image platform is derived from it so the two cannot drift.
 AWS_LAMBDA_ARCH ?= x86_64
@@ -94,7 +109,9 @@ endef
 
 .PHONY: help up up-build down down-v logs ps migrate revision seed test lint fmt shell-backend psql \
         aws-whoami aws-deploy aws-deploy-auth aws-auth-env aws-ecr aws-push aws-deploy-backend aws-migrate aws-url aws-status aws-logs \
-        aws-frontend-cert aws-deploy-frontend aws-frontend-url aws-destroy
+        aws-frontend-cert aws-deploy-frontend aws-frontend-url aws-destroy \
+        report-local aws-deploy-reports aws-reports-stack report-now report-direct report-list \
+        report-triggers report-logs report-queues
 
 help:
 	@grep -hE '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -348,11 +365,126 @@ aws-deploy-frontend: ## Deploy the frontend to S3 + CloudFront, built against th
 aws-frontend-url: ## Print the deployed site URL
 	@$(call stack-output,$(FRONTEND_STACK),SiteUrl)
 
+# --- lab 5: the weekly report, built by events --------------------------------
+
+report-local: ## Build one week's report against the compose database: make report-local WEEK=2026-W41
+	@test -n "$(WEEK)" || { echo "Usage: make report-local WEEK=2026-W41"; exit 1; }
+	$(COMPOSE) exec -T backend python -m app.reports.weekly "$(WEEK)" > "report-$(WEEK).csv"
+	@echo "Wrote report-$(WEEK).csv"
+
+aws-deploy-reports: aws-push ## Push the backend image, then deploy the report stack (queue, builder, mailer, schedule)
+	@$(MAKE) --no-print-directory aws-reports-stack
+
+aws-reports-stack: ## Deploy infra/reports.yml with the image already in ECR (no rebuild)
+	$(require-aws-credentials)
+	@test -n "$(REPORTS_SENDER)" || { \
+		echo "REPORTS_SENDER is empty — set it in .env to a verified SES identity (your email)"; exit 1; }
+	@fn=$$($(call stack-output,$(APP_STACK),FunctionName) 2>/dev/null | tr -d '[:space:]'); \
+		case "$$fn" in ""|None) echo "No backend found — run: make aws-deploy-backend (lab 4)"; exit 1 ;; esac; \
+		cfg() { $(AWS) lambda get-function-configuration --function-name "$$fn" --query "$$1" --output text; }; \
+		vpc=$$(cfg VpcConfig.VpcId | tr -d '[:space:]'); \
+		subnets=$$(cfg VpcConfig.SubnetIds | tr '[:space:]' ',' | sed 's/,*$$//'); \
+		sg=$$(cfg 'VpcConfig.SecurityGroupIds[0]' | tr -d '[:space:]'); \
+		dburl=$$(cfg Environment.Variables.DATABASE_URL | tr -d '[:space:]'); \
+		tz=$$(cfg Environment.Variables.APP_TIMEZONE | tr -d '[:space:]'); \
+		routes=$$($(AWS) ec2 describe-route-tables --filters Name=vpc-id,Values=$$vpc \
+			--query 'RouteTables[].RouteTableId' --output text | tr '[:space:]' ',' | sed 's/,*$$//'); \
+		s3ep="$(REPORTS_CREATE_S3_ENDPOINT)"; \
+		if [ -z "$$s3ep" ]; then \
+			if $(AWS) cloudformation describe-stack-resource --stack-name $(REPORTS_STACK) \
+				--logical-resource-id S3GatewayEndpoint >/dev/null 2>&1; then s3ep=true; \
+			elif [ "$$($(AWS) ec2 describe-vpc-endpoints --filters Name=vpc-id,Values=$$vpc \
+				Name=service-name,Values=com.amazonaws.$(AWS_REGION).s3 Name=vpc-endpoint-type,Values=Gateway \
+				--query 'length(VpcEndpoints)' --output text | tr -d '[:space:]')" != "0" ]; then \
+				s3ep=false; echo "$$vpc already has an S3 gateway endpoint — reusing it"; \
+			else s3ep=true; fi; \
+		fi; \
+		repo=$$($(call stack-output,$(ECR_STACK),RepositoryUri) | tr -d '[:space:]'); \
+		digest=$$($(AWS) ecr describe-images --repository-name "$${repo#*/}" \
+			--image-ids imageTag=$(IMAGE_TAG) --query 'imageDetails[0].imageDigest' \
+			--output text | tr -d '[:space:]'); \
+		echo "vpc=$$vpc subnets=$$subnets sg=$$sg routes=$$routes s3-endpoint=$$s3ep"; \
+		echo "image=$$repo@$$digest schedule=$(REPORTS_SCHEDULE) -> $(REPORTS_SCHEDULE_TARGET) fail-week=$(or $(REPORTS_FAIL_WEEK),none)"; \
+		$(call wait-stack-idle,$(REPORTS_STACK)); \
+		$(call clear-failed-create,$(REPORTS_STACK)); \
+		$(AWS) cloudformation deploy \
+			--stack-name $(REPORTS_STACK) \
+			--template-file infra/reports.yml \
+			--capabilities CAPABILITY_IAM \
+			--no-fail-on-empty-changeset \
+			$(STACK_TAGS) \
+			--parameter-overrides \
+				"ProjectName=$(PROJECT_NAME)" \
+				"VpcId=$$vpc" \
+				"SubnetIds=$$subnets" \
+				"SecurityGroupId=$$sg" \
+				"RouteTableIds=$$routes" \
+				"CreateS3Endpoint=$$s3ep" \
+				ImageUri="$$repo@$$digest" \
+				"Architecture=$(AWS_LAMBDA_ARCH)" \
+				"DatabaseUrl=$$dburl" \
+				"AppTimezone=$${tz:-Europe/Kyiv}" \
+				"ScheduleExpression=$(REPORTS_SCHEDULE)" \
+				"ScheduleTarget=$(REPORTS_SCHEDULE_TARGET)" \
+				"FailWeek=$(REPORTS_FAIL_WEEK)" \
+				"SenderEmail=$(REPORTS_SENDER)" \
+				"Recipients=$(REPORTS_RECIPIENTS)" \
+				"SenderDomain=$(REPORTS_DOMAIN)"
+	@$(AWS) cloudformation describe-stacks --stack-name $(REPORTS_STACK) \
+		--query 'Stacks[0].Outputs[].[OutputKey,OutputValue]' --output table
+
+report-now: ## Ask for one week's report through the queue: make report-now WEEK=2026-W41
+	@test -n "$(WEEK)" || { echo "Usage: make report-now WEEK=2026-W41"; exit 1; }
+	@q=$$($(call stack-output,$(REPORTS_STACK),QueueUrl) | tr -d '[:space:]'); \
+		echo "Sending {\"week\": \"$(WEEK)\"} to $$q"; \
+		$(AWS) sqs send-message --queue-url "$$q" \
+			--message-body '{"week": "$(WEEK)", "source": "manual"}' \
+			--query MessageId --output text
+
+report-direct: ## Invoke the builder directly, the way the step-3 schedule does (no queue)
+	@fn=$$($(call stack-output,$(REPORTS_STACK),BuilderFunctionName) | tr -d '[:space:]'); \
+		$(AWS) lambda invoke --function-name "$$fn" --cli-binary-format raw-in-base64-out \
+			--payload '{"week": null, "source": "schedule"}' /dev/stdout
+
+report-list: ## List the reports in S3 (submission item 3)
+	@b=$$($(call stack-output,$(REPORTS_STACK),BucketName) | tr -d '[:space:]'); \
+		$(AWS) s3 ls "s3://$$b/reports/" --recursive
+
+report-triggers: ## The "triggered" log lines of both functions (submission item 4): make report-triggers SINCE=3h
+	@echo "== report-builder"
+	@$(AWS) logs tail /aws/lambda/$(PROJECT_NAME)-report-builder --since $(SINCE) \
+		--format short --filter-pattern '"report-builder triggered"'
+	@echo "== report-mailer"
+	@$(AWS) logs tail /aws/lambda/$(PROJECT_NAME)-report-mailer --since $(SINCE) \
+		--format short --filter-pattern '"report-mailer triggered"'
+
+report-logs: ## Everything both report functions logged recently: make report-logs SINCE=30m
+	$(AWS) logs tail /aws/lambda/$(PROJECT_NAME)-report-builder --since $(SINCE) --format short
+	$(AWS) logs tail /aws/lambda/$(PROJECT_NAME)-report-mailer --since $(SINCE) --format short
+
+report-queues: ## Messages waiting in the request queue and in its dead-letter queue
+	@for k in QueueUrl DlqUrl; do \
+		q=$$($(call stack-output,$(REPORTS_STACK),$$k) | tr -d '[:space:]'); \
+		printf '%-8s ' "$$k"; \
+		$(AWS) sqs get-queue-attributes --queue-url "$$q" --attribute-names \
+			ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible \
+			--query 'Attributes.[ApproximateNumberOfMessages,ApproximateNumberOfMessagesNotVisible]' \
+			--output text | awk '{ print "waiting=" $$1 " in-flight=" $$2 }'; \
+	done
+
 aws-destroy: ## Delete every stack, including the database and its data
 	$(require-aws-credentials)
-	@printf 'Delete %s, %s, %s and %s? The Aurora cluster and all its data, and every user account, go with them (no snapshot). Type yes: ' \
-		"$(FRONTEND_STACK)" "$(APP_STACK)" "$(AUTH_STACK)" "$(ECR_STACK)"; \
+	@printf 'Delete %s, %s, %s, %s and %s? The Aurora cluster and all its data, and every user account, go with them (no snapshot). Type yes: ' \
+		"$(REPORTS_STACK)" "$(FRONTEND_STACK)" "$(APP_STACK)" "$(AUTH_STACK)" "$(ECR_STACK)"; \
 		read answer; test "$$answer" = "yes" || { echo "Aborted."; exit 1; }
+	@# The report stack uses the backend's security group, so it goes first.
+	@bucket=$$($(call stack-output,$(REPORTS_STACK),BucketName) 2>/dev/null | tr -d '[:space:]'); \
+		if [ -n "$$bucket" ] && [ "$$bucket" != "None" ]; then \
+			echo "Emptying s3://$$bucket"; \
+			$(AWS) s3 rm "s3://$$bucket" --recursive --only-show-errors || true; \
+		fi
+	-$(AWS) cloudformation delete-stack --stack-name $(REPORTS_STACK)
+	-$(AWS) cloudformation wait stack-delete-complete --stack-name $(REPORTS_STACK)
 	@bucket=$$($(call stack-output,$(FRONTEND_STACK),BucketName) 2>/dev/null | tr -d '[:space:]'); \
 		if [ -n "$$bucket" ] && [ "$$bucket" != "None" ]; then \
 			echo "Emptying s3://$$bucket"; \

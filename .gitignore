@@ -15,3 +15,6 @@ next-env.d.ts
 .env*.local
 .idea/
 .DS_Store
+
+# lab 5: make report-local output
+/report-*.csv
